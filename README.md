@@ -40,7 +40,7 @@ $$
 The domain is an ellipsoid with an interior ball removed. The prescribed exact solution is
 
 $$
-u(t,x)=\exp^{\cos t}x_{k_1}x_{k_2}\exp(-\lVert x\rVert^2),\qquad k_1\ne k_2,
+u(t,x)=e^{\cos t}x_{k_1}x_{k_2}\exp(-\lVert x\rVert^2),\qquad k_1\ne k_2,
 $$
 
 and the exterior data are given by the same expression. The nonlinearity is $\eta(\exp(\beta u)-u)$.
