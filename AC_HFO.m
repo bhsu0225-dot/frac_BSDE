@@ -1,56 +1,88 @@
 % ============================================================
 % High-dimensional semilinear PDE on cube
-% 2D-binning conditional expectation on (x1*x2, |x|^2)
+% Phi(x) = (prod_j sin(k*pi*x_j), |x|^2), kappa = 2.
 %
-% Domain: [-L,L]^d, Dirichlet boundary u=0 on boundary.
+% Domain: (-L,L)^d, zero boundary/exterior payoff.
 % Manufactured exact solution:
 %   u(t,x) = cos(lambda_t * t) * prod_{j=1}^d sin(k*pi*x_j)
 %
 % PDE:
-%   u_t + Delta u + f(u) + q(t,x) = 0
+%   u_t + Delta u + f(u) = q(t,x)
 % with
 %   f(u) = cos(u) + exp(sin(u^2))
 % and
-%   q = -(u_t + Delta u + f(u)).
+%   q = u_t + Delta u + f(u).
+% Thus the BSDE source is f(y)-q(t,x).
 % ============================================================
 
-clc; clear; rng(2025);
+clc; clear;
 
 %% ---------------- User parameters ----------------
 d   = 11;
 L   = 1.0;
 T   = 0.5;
 t0  = 0.0;
-N   = 10000;
+N   = 64000;
 M   = 2000;
 K   = 201;
 
-k_list   = 10;
+k_list   = [3, 7, 11, 15];
 lambda_t = 1;
 
-dt    = (T - t0) / N;
-sqrt2 = sqrt(2);
-
 % ----- 2D binning CE parameters -----
-NBIN1    = 501;
-NBIN2    = 501;
+NBIN1    = 500;
+NBIN2    = 500;
 SMOOTHIT = 2;
 
-% features
-p1_fun = @(X) (X(:,1).*X(:,2));
-r2_fun = @(X) sum(X.^2,2);
+% ----- Solver, parallel computation, and output -----
+SCALAR_TOL   = 1e-12;
+NEWTON_MAXIT = 50;
+USE_PARALLEL = true;
+NUM_WORKERS  = 10;       % Limit concurrent path histories to control memory.
+BASE_SEED    = 2026;
+SAVE_FIGURES = true;
+output_dir   = fullfile(fileparts(mfilename('fullpath')), 'AC_HFO_results');
+
+assert(d >= 2 && d == floor(d), 'd must be an integer >= 2.');
+assert(T > t0 && L > 0, 'Require T > t0 and L > 0.');
+assert(all([N,M,K] >= 1) && all([N,M,K] == floor([N,M,K])), ...
+    'N, M, and K must be positive integers.');
+assert(all(k_list > 0) && all(abs(k_list*L-round(k_list*L)) < 1e-12), ...
+    'Require k*L to be an integer for the manufactured zero boundary data.');
+assert(all([NBIN1,NBIN2] >= 2) && all([NBIN1,NBIN2] == floor([NBIN1,NBIN2])) ...
+    && SMOOTHIT >= 0 && SMOOTHIT == floor(SMOOTHIT), 'Invalid feature grid.');
+assert(SCALAR_TOL > 0 && NEWTON_MAXIT >= 1 && NEWTON_MAXIT == floor(NEWTON_MAXIT), ...
+    'Invalid scalar-solver parameters.');
+assert(NUM_WORKERS >= 1 && NUM_WORKERS == floor(NUM_WORKERS), 'Invalid worker count.');
+dt = (T - t0) / N;
+rng(BASE_SEED, 'twister');
+
+nWorkers = 0;
+if USE_PARALLEL
+    assert(license('test','Distrib_Computing_Toolbox'), ...
+        'Parallel Computing Toolbox is required. Set USE_PARALLEL=false for serial execution.');
+    pool = gcp('nocreate');
+    if isempty(pool)
+        pool = parpool('local', NUM_WORKERS);
+    end
+    nWorkers = min(NUM_WORKERS, pool.NumWorkers);
+end
+if SAVE_FIGURES && ~exist(output_dir, 'dir')
+    mkdir(output_dir);
+end
 
 fprintf('d=%d, cube=[-%.1f,%.1f]^d, T=%.3f, N=%d, M=%d, K=%d, lambda=%.2f\n', ...
     d, L, L, T, N, M, K, lambda_t);
 fprintf('2D binning CE: NBIN1=%d, NBIN2=%d, SMOOTHIT=%d\n', ...
     NBIN1, NBIN2, SMOOTHIT);
+fprintf('Parallel workers: %d | Newton residual tolerance: %.1e\n', nWorkers, SCALAR_TOL);
 
 %% ---------------- Loop over k ----------------
 for kk = 1:numel(k_list)
     kfreq = k_list(kk);
 
     % Choose diagonal points so sin(k*pi*a)=±1 when possible
-    a  = make_a_grid(K, kfreq, 0.98);
+    a  = make_a_grid(K, kfreq, 0.98*L);
     X0 = repmat(a(:), 1, d);
 
     fprintf('\n==================== k = %d ====================\n', kfreq);
@@ -58,20 +90,23 @@ for kk = 1:numel(k_list)
     results    = zeros(K, 4);  % [u_exact, u_num, abs_err, rel_err]
     u_num_list = zeros(K, 1);
     u_ex_list  = zeros(K, 1);
-    stderr_list = zeros(K,1);
-
     % ordered print queue
-    q = parallel.pool.DataQueue;
-    afterEach(q, @(data) orderedPrint(data, K));
+    orderedPrint([], K);
+    progressQueue = [];
+    if USE_PARALLEL
+        progressQueue = parallel.pool.DataQueue;
+        afterEach(progressQueue, @(data) orderedPrint(data, K));
+    end
 
     tic;
-    parfor kpt = 1:K
+    parfor (kpt = 1:K, nWorkers)
+        rng(BASE_SEED + (kk-1)*K + kpt, 'twister');
         x0 = X0(kpt, :);
 
-        [u_hat, stderr] = fk_estimate( ...
-            x0, t0, T, L, d, N, M, dt, sqrt2, ...
-            NBIN1, NBIN2, SMOOTHIT, p1_fun, r2_fun, ...
-            kfreq, lambda_t);
+        u_hat = fk_estimate( ...
+            x0, t0, T, L, d, N, M, dt, ...
+            NBIN1, NBIN2, SMOOTHIT, kfreq, lambda_t, ...
+            SCALAR_TOL, NEWTON_MAXIT);
 
         u_ex   = u_exact(t0, x0, kfreq, lambda_t);
         abs_er = abs(u_hat - u_ex);
@@ -80,16 +115,15 @@ for kk = 1:numel(k_list)
         results(kpt,:)   = [u_ex, u_hat, abs_er, rel_er];
         u_num_list(kpt)  = u_hat;
         u_ex_list(kpt)   = u_ex;
-        stderr_list(kpt) = stderr;
-
-        send(q, struct( ...
-            'kpt',    kpt, ...
-            'a',      a(kpt), ...
-            'u_ex',   u_ex, ...
-            'u_num',  u_hat, ...
-            'stderr', stderr ));
+        data = [kpt, a(kpt), u_ex, u_hat];
+        if USE_PARALLEL
+            send(progressQueue, data);
+        else
+            orderedPrint(data, K);
+        end
     end
     t_elapsed = toc;
+    drawnow;
 
     fprintf('\n=== SUMMARY (k=%d) ===\n', kfreq);
     disp(array2table(results, 'VariableNames', {'u_exact','u_num','abs_err','rel_err'}));
@@ -125,183 +159,68 @@ for kk = 1:numel(k_list)
     set(gca, 'FontSize', 16, 'LineWidth', 1.0);
 
     %% ----- save figure -----
-    % figName = 'HFO_bin2d_2000_64000_11_15';
-    % savefig(fig, [figName '.fig']);
-    % print(fig, [figName '.eps'], '-depsc2');
-    % fprintf('Figure saved as "%s.fig" and "%s.eps"\n', figName, figName);
+    if SAVE_FIGURES
+        figName = fullfile(output_dir, sprintf('HFO%d_%d_%d_%d', M, N, d, kfreq));
+        set(fig, 'PaperPositionMode', 'auto');
+        savefig(fig, [figName '.fig']);
+        print(fig, [figName '.eps'], '-depsc2', '-painters');
+        print(fig, [figName '.pdf'], '-dpdf', '-bestfit', '-painters');
+        fprintf('Figure saved as "%s.fig", ".eps", and ".pdf"\n', figName);
+    end
 end
 
 %% =======================================================================
-function [u_hat, stderr] = fk_estimate( ...
-    x0, t0, T, L, d, N, M, dt, sqrt2, ...
-    NBIN1, NBIN2, SMOOTHIT, p1_fun, r2_fun, ...
-    kfreq, lambda_t)
+function u_hat = fk_estimate( ...
+    x0, t0, T, L, d, N, M, dt, ...
+    NBIN1, NBIN2, SMOOTHIT, kfreq, lambda_t, scalar_tol, itMax)
 
-X      = cell(N+1,1);
-alive  = cell(N+1,1);
-dteff  = cell(N,1);
-incq   = cell(N,1);
-exited = cell(N,1);
-bpay   = cell(N,1);
-
-X{1}     = repmat(x0, M, 1);
+assert(numel(x0) == d && all(abs(x0) < L), 'The initial point must be interior.');
+assert(abs(N*dt-(T-t0)) <= 1e-12*max(1,T-t0), 'Inconsistent time grid.');
+X        = repmat(x0, M, 1);
+features = cell(N,1);
+alive    = cell(N+1,1);
 alive{1} = true(M,1);
-t        = t0 * ones(M,1);
-
 payoff = zeros(M,1);
-last_k = 1;
+Nf = 0;
 
 for k = 1:N
-    tk = t0 + (k-1)*dt;
-    Xk = X{k};
     al = alive{k};
+    Xk = X(al,:);
+    features{k} = [prod_sin_kpi(Xk, kfreq), sum(Xk.^2,2)];
 
-    exited{k} = false(M,1);
-    bpay{k}   = zeros(M,1);
-    incq{k}   = zeros(M,1);
-    dteff{k}  = zeros(M,1);
-    dteff{k}(al) = dt;
-
-    % Euler proposal
-    step = zeros(M,d);
-    step(al,:) = sqrt2*sqrt(dt)*randn(nnz(al),d);
-    Xnew = Xk + step;
-    tnew = t + dt;
-
-    % cube exit detection
-    was_in  = all(abs(Xk) < L, 2);
-    now_out = any(abs(Xnew) >= L, 2);
-    ex      = al & was_in & now_out;
-    idx_ok  = al & ~ex;
-
-    % ---- survivors: full-step midpoint quadrature ----
-    if any(idx_ok)
-        Xmid = Xk(idx_ok,:) + 0.5 * step(idx_ok,:);
-        tmid = tk + 0.5 * dt;
-        incq{k}(idx_ok) = q_fun_mms_general(tmid, Xmid, d, kfreq, lambda_t) * dt;
-    end
-
-    % ---- exiting particles: first-hit interpolation ----
-    if any(ex)
-        idx = find(ex);
-
-        Xk_ex   = Xk(idx,:);
-        Xnew_ex = Xnew(idx,:);
-        V_ex    = step(idx,:);
-
-        theta_hit = cube_hit_theta(Xk_ex, Xnew_ex, L);
-        theta_hit = min(max(theta_hit, 0), 1);
-
-        ttau = t(idx) + theta_hit * dt;
-
-        % truncated midpoint quadrature
-        Xmid_ex = Xk_ex + 0.5 * theta_hit .* V_ex;
-        tmid_ex = tk + 0.5 * theta_hit * dt;
-
-        incq{k}(idx) = q_fun_mms_general(tmid_ex, Xmid_ex, d, kfreq, lambda_t) ...
-                     .* (theta_hit * dt);
-
-        dteff{k}(idx) = theta_hit * dt;
-
-        % Dirichlet boundary value = 0
-        g_now = zeros(size(ttau));
-        payoff(idx)    = g_now;
-        exited{k}(idx) = true;
-        bpay{k}(idx)   = g_now;
-
-        % Retain the exterior candidate and record only the reconstructed time.
-        % No increments are generated for this label in later steps.
-        t(idx) = ttau;
-    end
-
-    X{k+1} = Xnew;
-
-    al_next     = al;
-    al_next(ex) = false;
-    alive{k+1}  = al_next;
-
-    if any(al_next)
-        t(al_next) = tnew(al_next);
-    end
-
-    last_k = k+1;
-    if ~any(al_next), break; end
+    % Exact Brownian increment for alpha=2 and generator Delta.
+    Xnew = Xk + sqrt(2*dt)*randn(nnz(al),d);
+    X(al,:) = Xnew;                     % Retain the exterior candidate.
+    alive{k+1} = al;
+    alive{k+1}(al) = all(abs(Xnew) < L,2);
+    Nf = k;
+    if ~any(alive{k+1}), break; end
 end
 
 % terminal payoff for survivors
-idx_T = alive{last_k};
+idx_T = alive{Nf+1};
 if any(idx_T)
-    payoff(idx_T) = phi_fun(T, X{last_k}(idx_T,:), kfreq, lambda_t);
+    payoff(idx_T) = phi_fun(T, X(idx_T,:), kfreq, lambda_t);
 end
 
 % backward recursion
-Nf = last_k - 1;
-Y  = cell(Nf+1,1);
-Y{Nf+1} = payoff;
-
+Y = payoff;
 for k = Nf:-1:1
     Ik = find(alive{k});
-    if isempty(Ik)
-        Y{k} = Y{k+1};
-        continue;
-    end
+    tk = t0 + (k-1)*dt;
+    p1k = features{k}(:,1);
+    r2k = features{k}(:,2);
+    target = Y(Ik) - dt*q_fun_mms_general(tk, p1k, d, kfreq, lambda_t);
+    Hk = ce_bin2d_sumcount(p1k,r2k,target,NBIN1,NBIN2,SMOOTHIT);
 
-    XkI = X{k}(Ik,:);
-    dtk = dteff{k}(Ik);
-
-    Ynext_eff = Y{k+1};
-    exk = exited{k};
-    if any(exk)
-        tmp = Ynext_eff;
-        tmp(exk) = bpay{k}(exk);
-        Ynext_eff = tmp;
-    end
-
-    target = Ynext_eff(Ik) + incq{k}(Ik);
-
-    % ===== 2D binning CE on (p1, r2) =====
-    p1k = p1_fun(XkI);
-    r2k = r2_fun(XkI);
-    Hk = ce_bin2d_sumcount(p1k,r2k,[target,dtk],NBIN1,NBIN2,SMOOTHIT);
-
-    % implicit nonlinear solve
-    Yk = solve_implicit(Hk(:,1),Hk(:,2), ...
-        @(y) cos(y)+exp(sin(y.^2)),[],200);
-
-    y_full     = Y{k+1};
-    y_full(Ik) = Yk;
-    Y{k}       = y_full;
+    % W*1=1 makes Hk+dt*f(y) exactly W[Ynext+dt*(f(y)-q)].
+    % In particular, the spatial source q remains inside the fitted target.
+    Y(Ik) = solve_implicit(Hk,dt, ...
+        @(y) cos(y)+exp(sin(y.^2)), ...
+        @(y) -sin(y)+2*y.*cos(y.^2).*exp(sin(y.^2)), scalar_tol, itMax);
 end
 
-u_hat  = mean(Y{1});
-stderr = NaN;
-end
-
-%% =======================================================================
-function theta_hit = cube_hit_theta(Xk, Xnew, L)
-[M,d] = size(Xk);
-V = Xnew - Xk;
-theta_hit = ones(M,1);
-
-for j = 1:d
-    x  = Xk(:,j);
-    v  = V(:,j);
-    xn = Xnew(:,j);
-
-    idx = (v > 0) & (x < L) & (xn >= L);
-    if any(idx)
-        th = (L - x(idx)) ./ v(idx);
-        theta_hit(idx) = min(theta_hit(idx), th);
-    end
-
-    idx = (v < 0) & (x > -L) & (xn <= -L);
-    if any(idx)
-        th = (-L - x(idx)) ./ v(idx);
-        theta_hit(idx) = min(theta_hit(idx), th);
-    end
-end
-
-theta_hit = min(max(theta_hit, 0), 1);
+u_hat = mean(Y);
 end
 
 %% ======================= Exact / Terminal ==============================
@@ -329,41 +248,39 @@ end
 end
 
 %% ======================= Source term q for MMS =========================
-function val = q_fun_mms_general(t, X, d, kfreq, lambda_t)
-% q = -(u_t + Delta u + cos(u) + exp(sin(u^2)))
-
-P = prod_sin_kpi(X, kfreq);
+function val = q_fun_mms_general(t, P, d, kfreq, lambda_t)
+% P is the first feature, prod_j sin(k*pi*x_j), at the current position.
+% Paper convention: q = u_t + Delta u + cos(u) + exp(sin(u^2)).
 u = cos(lambda_t * t) .* P;
 
 du_dt   = -lambda_t .* sin(lambda_t * t) .* P;
 Delta_u = -d * (kfreq*pi)^2 .* u;
 f       = cos(u) + exp(sin(u.^2));
 
-val = - (du_dt + Delta_u + f);
+val = du_dt + Delta_u + f;
 end
 
-%% ======================= Scalar contraction solve =========================
-function y = solve_implicit(H, step_dt, f, ~, itMax)
+%% ======================= Scalar Newton solve =============================
+function y = solve_implicit(H, step_dt, f, df, tol, itMax)
 H = H(:);
-if isscalar(step_dt)
-    step_dt = repmat(step_dt,size(H));
-else
-    step_dt = step_dt(:);
-end
-assert(numel(step_dt) == numel(H) && all(step_dt >= 0), 'Invalid step duration.');
+assert(isscalar(step_dt) && isfinite(step_dt) && step_dt >= 0, 'Invalid time step.');
 y = H;
-tol = 1e-12;
-for it = 1:max(200,itMax)
-    y = H + step_dt.*f(y);
-    residual = y - H - step_dt.*f(y);
+for it = 0:itMax
+    residual = y - H - step_dt*f(y);
     if any(~isfinite(y)) || any(~isfinite(residual))
-        error('IBSDE:ScalarSolve', 'Nonfinite fixed-point iterate. Check the time step and source.');
+        error('IBSDE:ScalarSolve', 'Nonfinite Newton iterate. Check the time step and source.');
     end
     if norm(residual,inf) <= tol
         return;
     end
+    if it == itMax, break; end
+    jacobian = 1-step_dt*df(y);
+    if any(~isfinite(jacobian)) || any(abs(jacobian) < 1e-12)
+        error('IBSDE:ScalarSolve', 'Singular Newton derivative. Reduce the time step.');
+    end
+    y = y-residual./jacobian;
 end
-error('IBSDE:ScalarSolve', 'Fixed-point residual exceeds tolerance. Reduce the time step.');
+error('IBSDE:ScalarSolve', 'Newton residual exceeds tolerance. Reduce the time step or increase NEWTON_MAXIT.');
 end
 
 
@@ -441,27 +358,21 @@ end
 
 %% =================== ordered print callback ============================
 function orderedPrint(data, K)
-    persistent last_printed results_buffer
-
-    if isempty(last_printed) || last_printed >= K
-        last_printed = 0;
-        results_buffer = containers.Map('KeyType','int32','ValueType','any');
-    end
-
-    results_buffer(data.kpt) = data;
-
-    k = last_printed + 1;
-    while isKey(results_buffer, k)
-        d = results_buffer(k);
-
-        abs_er = abs(d.u_num - d.u_ex);
-        rel_er = abs_er / max(1e-15, abs(d.u_ex));
-
-        fprintf('pt %3d/%3d | a=% .6f | exact=%.8e | num=%.8e | abs=%.2e | rel=%.2e\n', ...
-            d.kpt, K, d.a, d.u_ex, d.u_num, abs_er, rel_er);
-
-        last_printed = k;
-        remove(results_buffer, k);
-        k = k + 1;
-    end
+% data = [point index, diagonal coordinate, exact value, computed value].
+persistent next_printed results_buffer
+if isempty(data)
+    next_printed = 1;
+    results_buffer = cell(K,1);
+    return;
+end
+results_buffer{data(1)} = data;
+while next_printed <= K && ~isempty(results_buffer{next_printed})
+    row = results_buffer{next_printed};
+    abs_er = abs(row(4)-row(3));
+    rel_er = abs_er/max(1e-15,abs(row(3)));
+    fprintf('pt %3d/%3d | a=% .6f | exact=%.8e | num=%.8e | abs=%.2e | rel=%.2e\n', ...
+        row(1), K, row(2), row(3), row(4), abs_er, rel_er);
+    results_buffer{next_printed} = [];
+    next_printed = next_printed+1;
+end
 end
